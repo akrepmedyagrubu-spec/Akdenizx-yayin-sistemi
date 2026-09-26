@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: m3u8-yayin
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"

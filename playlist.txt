@@ -1,0 +1,5 @@
+# Her satıra bir video dosya adı yaz. Sıra aynen korunur.
+# Örnek dosyaları media/ klasörüne koyunuz ve aşağıdaki adları düzenleyiniz.
+video1.mp4
+reklam.mp4
+video2.mp4
