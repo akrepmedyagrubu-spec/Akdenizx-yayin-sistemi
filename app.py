@@ -33,9 +33,9 @@ def load_playlist() -> list[str]:
         raise RuntimeError(f"playlist.txt bulunamadı: {PLAYLIST_FILE}")
 
     entries = []
-    lines = PLAYLIST_FILE.read_text(encoding="utf-8-sig").splitlines()
-
-    for line_number, raw in enumerate(lines, 1):
+    for line_number, raw in enumerate(
+        PLAYLIST_FILE.read_text(encoding="utf-8-sig").splitlines(), 1
+    ):
         item = raw.strip()
         if not item or item.startswith("#"):
             continue
@@ -44,7 +44,7 @@ def load_playlist() -> list[str]:
         if path.is_absolute() or ".." in path.parts:
             raise RuntimeError(
                 f"playlist.txt:{line_number}: "
-                "Yalnızca media/ içindeki dosya adı yazılabilir"
+                "Yalnızca media/ içindeki göreli dosya adlarını kullan"
             )
 
         video = (VIDEO_DIR / path).resolve()
@@ -62,8 +62,12 @@ def load_playlist() -> list[str]:
 
 
 def publish_loop() -> None:
+    global PORT
+
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    sequence = 0
 
     while True:
         try:
@@ -85,7 +89,10 @@ def publish_loop() -> None:
                     )
                     continue
 
-                segment_pattern = OUTPUT_DIR / "segment_%06d.ts"
+                sequence += 1
+                segment_pattern = OUTPUT_DIR / (
+                    f"segment_{sequence:08d}_%06d.ts"
+                )
 
                 command = [
                     "ffmpeg",
@@ -93,10 +100,16 @@ def publish_loop() -> None:
                     "-loglevel", "warning",
                     "-nostdin",
                     "-y",
+
+                    # Kaynağı gerçek zamanında oku; hızlıca tüketip döngüyü
+                    # erkenden başlatma.
+                    "-re",
                     "-i", str(video),
+
                     "-loop", "1",
                     "-framerate", str(FPS),
                     "-i", str(logo),
+
                     "-filter_complex",
                     (
                         f"[0:v]scale={WIDTH}:{HEIGHT}:flags=bilinear,"
@@ -106,8 +119,10 @@ def publish_loop() -> None:
                         "[base][mark]overlay=0:0:shortest=1,"
                         "format=yuv420p[outv]"
                     ),
+
                     "-map", "[outv]",
                     "-map", "0:a?",
+
                     "-c:v", "libx264",
                     "-preset", "ultrafast",
                     "-threads", "2",
@@ -117,23 +132,30 @@ def publish_loop() -> None:
                     "-r", str(FPS),
                     "-g", str(FPS * 2),
                     "-sc_threshold", "0",
+
                     "-c:a", "aac",
                     "-b:a", "96k",
                     "-ar", "44100",
                     "-ac", "2",
+
                     "-f", "hls",
                     "-hls_time", str(SEGMENT_SECONDS),
                     "-hls_list_size", str(LIST_SIZE),
                     "-hls_flags",
                     (
                         "append_list+delete_segments+omit_endlist+"
-                        "independent_segments+temp_file"
+                        "discont_start+independent_segments+temp_file"
                     ),
                     "-hls_segment_filename", str(segment_pattern),
                     str(OUTPUT_DIR / "stream.m3u8"),
                 ]
 
-                LOG.info("Yayınlanıyor: %s (overlay: %s)", item, logo_name)
+                LOG.info(
+                    "Yayınlanıyor: %s (overlay: %s)",
+                    item,
+                    logo_name,
+                )
+
                 result = subprocess.run(command, check=False)
 
                 if result.returncode:
@@ -146,7 +168,9 @@ def publish_loop() -> None:
                     LOG.info("Tamamlandı: %s", item)
 
         except Exception:
-            LOG.exception("Yayın döngüsünde hata; 5 saniye sonra tekrar denenecek")
+            LOG.exception(
+                "Yayın döngüsünde hata; 5 saniye sonra tekrar denenecek"
+            )
             time.sleep(5)
 
 
