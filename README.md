@@ -1,4 +1,4 @@
-# 540p HLS video yayını
+# Akdeniz yayın sistemi
 
 Bu depo, `playlist.txt` içindeki videoları sırayla FFmpeg ile işler ve Render üzerinde sabit `stream.m3u8` adresinden sunar.
 
