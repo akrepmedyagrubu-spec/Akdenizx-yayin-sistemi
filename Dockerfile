@@ -6,6 +6,8 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY app.py /app/app.py
+COPY playlist.txt /app/playlist.txt
+COPY media/ /app/media/
 ENV PORT=10000 VIDEO_DIR=/app/media OUTPUT_DIR=/app/public
 EXPOSE 10000
 CMD ["python", "-u", "/app/app.py"]
