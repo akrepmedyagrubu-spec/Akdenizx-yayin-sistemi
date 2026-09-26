@@ -27,7 +27,7 @@ playlist.txt
 ## Render kurulumu
 
 1. Bu dosyaları GitHub deposuna gönderin; `media/` içine videoları ve logoları ekleyin, `playlist.txt` listesini düzenleyin.
-2. Render Dashboard'da **New + → Blueprint** ile bu depoyu seçin. `render.yaml`, Docker web servisini tanımlar.
+2. Render Dashboard'da **New + → Web service** ile bu depoyu seçin. `render.yaml`, Docker web servisini tanımlar.
 3. İlk dağıtımın tamamlanmasını bekleyin. Servis adresiniz `https://<servis-adı>.onrender.com` biçiminde olur.
 4. Yayın URL'si: `https://<servis-adı>.onrender.com/stream.m3u8`. Kök adres `/` de bu URL'ye yönlenir.
 
