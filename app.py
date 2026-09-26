@@ -20,7 +20,10 @@ LOG = logging.getLogger("hls-publisher")
 ROOT = pathlib.Path(__file__).resolve().parent
 VIDEO_DIR = pathlib.Path(os.getenv("VIDEO_DIR", ROOT / "media")).resolve()
 OUTPUT_DIR = pathlib.Path(os.getenv("OUTPUT_DIR", ROOT / "public")).resolve()
-PLAYLIST_FILE = pathlib.Path(os.getenv("PLAYLIST_FILE", ROOT / "playlist.txt")).resolve()
+PLAYLIST_FILE = pathlib.Path(
+    os.getenv("PLAYLIST_FILE", ROOT / "playlist.txt")
+).resolve()
+CONCAT_FILE = pathlib.Path("/tmp/hls_playlist.ffconcat")
 PORT = int(os.getenv("PORT", "10000"))
 
 WIDTH = 854
@@ -28,25 +31,41 @@ HEIGHT = 480
 FPS = 24
 SEGMENT_SECONDS = 2
 LIST_SIZE = 12
-CONCAT_FILE = pathlib.Path("/tmp/hls_playlist.ffconcat")
 
 
-def load_playlist() -> list[tuple[str, pathlib.Path, float]]:
+def probe_video(video: pathlib.Path) -> dict:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries",
+            "format=duration:stream=codec_type,codec_name,sample_rate,channels",
+            "-of", "json",
+            str(video),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def load_playlist() -> list[tuple[str, pathlib.Path, float, tuple]]:
     if not PLAYLIST_FILE.is_file():
         raise RuntimeError(f"playlist.txt bulunamadı: {PLAYLIST_FILE}")
 
     entries = []
+    reference_streams = None
 
     for line_number, raw in enumerate(
-        PLAYLIST_FILE.read_text(encoding="utf-8-sig").splitlines(), 1
+        PLAYLIST_FILE.read_text(encoding="utf-8-sig").splitlines(),
+        1,
     ):
         item = raw.strip()
-
         if not item or item.startswith("#"):
             continue
 
         relative_path = pathlib.Path(item)
-
         if relative_path.is_absolute() or ".." in relative_path.parts:
             raise RuntimeError(
                 f"playlist.txt:{line_number}: "
@@ -54,28 +73,33 @@ def load_playlist() -> list[tuple[str, pathlib.Path, float]]:
             )
 
         video = (VIDEO_DIR / relative_path).resolve()
-
         if not video.is_relative_to(VIDEO_DIR) or not video.is_file():
             raise RuntimeError(
                 f"playlist.txt:{line_number}: Video bulunamadı: {item}"
             )
 
-        probe = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-show_entries", "stream=codec_type,codec_name,sample_rate,channels",
-                "-of", "json",
-                str(video),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        info = json.loads(probe.stdout)
+        info = probe_video(video)
         duration = float(info["format"]["duration"])
-        entries.append((item, video, duration))
+        streams = tuple(
+            (
+                stream.get("codec_type"),
+                stream.get("codec_name"),
+                stream.get("sample_rate"),
+                stream.get("channels"),
+            )
+            for stream in info.get("streams", [])
+            if stream.get("codec_type") in ("video", "audio")
+        )
+
+        if reference_streams is None:
+            reference_streams = streams
+        elif streams != reference_streams:
+            raise RuntimeError(
+                "Tek FFmpeg akışı için playlist'teki videoların ses/video "
+                "codec yapısı aynı olmalı. Uyumsuz dosya: " + item
+            )
+
+        entries.append((item, video, duration, streams))
 
     if not entries:
         raise RuntimeError("playlist.txt içinde yayınlanacak video yok")
@@ -83,81 +107,35 @@ def load_playlist() -> list[tuple[str, pathlib.Path, float]]:
     return entries
 
 
-def quoted_concat_path(path: pathlib.Path) -> str:
-    # FFmpeg concat-list söz diziminde tek tırnakları kaçır.
+def ffconcat_escape(path: pathlib.Path) -> str:
     return str(path).replace("'", "'\\''")
 
 
-def check_compatible_media(entries: list[tuple[str, pathlib.Path, float]]) -> None:
-    reference = None
-
-    for item, video, _duration in entries:
-        probe = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "stream=codec_type,codec_name,sample_rate,channels",
-                "-of", "json",
-                str(video),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        streams = json.loads(probe.stdout).get("streams", [])
-        signature = tuple(
-            (stream.get("codec_type"), stream.get("codec_name"),
-             stream.get("sample_rate"), stream.get("channels"))
-            for stream in streams
-            if stream.get("codec_type") in ("video", "audio")
-        )
-
-        if reference is None:
-            reference = signature
-        elif signature != reference:
-            raise RuntimeError(
-                "Tek FFmpeg akışı için videoların ses/video akışları aynı "
-                "codec ve ses kanal yapısında olmalı. "
-                f"Uyumsuz video: {item}"
-            )
-
-
-def build_concat_file(entries: list[tuple[str, pathlib.Path, float]]) -> None:
-    lines = ["ffconcat version 1.0"]
-
-    for _item, video, _duration in entries:
-        lines.append(f"file '{quoted_concat_path(video)}'")
-
-    CONCAT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def make_ad_enable_expression(
-    entries: list[tuple[str, pathlib.Path, float]]
-) -> str:
-    cycle_duration = sum(duration for _item, _video, duration in entries)
-    if cycle_duration <= 0:
+def make_ad_expression(entries: list[tuple]) -> str:
+    total_duration = sum(entry[2] for entry in entries)
+    if total_duration <= 0:
         raise RuntimeError("Playlist süresi okunamadı")
 
-    intervals = []
+    ad_ranges = []
     position = 0.0
 
-    for item, _video, duration in entries:
+    for item, _video, duration, _streams in entries:
         if pathlib.Path(item).name.lower() == "reklam.mp4":
             end = position + duration
-            intervals.append(
-                "gte(mod(t\\,{cycle})\\,{start})*"
-                "lt(mod(t\\,{cycle})\\,{end})".format(
-                    cycle=f"{cycle_duration:.6f}",
+            ad_ranges.append(
+                "gte(mod(t\\,{total})\\,{start})*"
+                "lt(mod(t\\,{total})\\,{end})".format(
+                    total=f"{total_duration:.6f}",
                     start=f"{position:.6f}",
                     end=f"{end:.6f}",
                 )
             )
         position += duration
 
-    return "+".join(intervals) if intervals else "0"
+    return "+".join(ad_ranges) if ad_ranges else "0"
 
 
-def ffmpeg_command(entries: list[tuple[str, pathlib.Path, float]]) -> list[str]:
+def build_ffmpeg_command(entries: list[tuple]) -> list[str]:
     regular_logo = VIDEO_DIR / "yayin.png"
     ad_logo = VIDEO_DIR / "reklam.png"
 
@@ -166,16 +144,27 @@ def ffmpeg_command(entries: list[tuple[str, pathlib.Path, float]]) -> list[str]:
     if not ad_logo.is_file():
         raise RuntimeError("media/reklam.png bulunamadı")
 
-    build_concat_file(entries)
-    ad_enable = make_ad_enable_expression(entries)
+    CONCAT_FILE.write_text(
+        "ffconcat version 1.0\n"
+        + "".join(
+            f"file '{ffconcat_escape(video)}'\n"
+            for _item, video, _duration, _streams in entries
+        ),
+        encoding="utf-8",
+    )
 
+    ad_expression = make_ad_expression(entries)
+
+    # Normal logo reklam aralığında kapalıdır.
+    # Reklam görseli yalnızca reklam.mp4 süresince açıktır.
     filter_graph = (
         f"[0:v]scale={WIDTH}:{HEIGHT}:flags=bilinear,setsar=1[base];"
         f"[1:v]scale={WIDTH}:{HEIGHT}:flags=bilinear[normal];"
         f"[2:v]scale={WIDTH}:{HEIGHT}:flags=bilinear[ad];"
-        "[base][normal]overlay=0:0[with_normal];"
-        f"[with_normal][ad]overlay=0:0:enable='{ad_enable}',"
-        "format=yuv420p[outv]"
+        f"[base][normal]overlay=0:0:"
+        f"enable='not({ad_expression})'[with_logo];"
+        f"[with_logo][ad]overlay=0:0:"
+        f"enable='{ad_expression}',format=yuv420p[outv]"
     )
 
     return [
@@ -185,14 +174,13 @@ def ffmpeg_command(entries: list[tuple[str, pathlib.Path, float]]) -> list[str]:
         "-nostdin",
         "-y",
 
-        # Tek concat girdisi; tüm playlist sonsuz döngüde ve gerçek zamanda.
+        # Tek FFmpeg girdisi tüm listeyi sırayla sonsuz döndürür.
         "-re",
         "-stream_loop", "-1",
         "-f", "concat",
         "-safe", "0",
         "-i", str(CONCAT_FILE),
 
-        # Logolar sabit kare olarak döner; playlist videosunun üstüne basılır.
         "-loop", "1",
         "-framerate", str(FPS),
         "-i", str(regular_logo),
@@ -213,7 +201,8 @@ def ffmpeg_command(entries: list[tuple[str, pathlib.Path, float]]) -> list[str]:
         "-r", str(FPS),
         "-g", str(FPS * SEGMENT_SECONDS),
         "-sc_threshold", "0",
-        "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})",
+        "-force_key_frames",
+        f"expr:gte(t,n_forced*{SEGMENT_SECONDS})",
 
         "-c:a", "aac",
         "-b:a", "96k",
@@ -225,32 +214,37 @@ def ffmpeg_command(entries: list[tuple[str, pathlib.Path, float]]) -> list[str]:
         "-hls_list_size", str(LIST_SIZE),
         "-hls_flags",
         "delete_segments+omit_endlist+independent_segments+temp_file",
-        "-hls_segment_filename", str(OUTPUT_DIR / "segment_%08d.ts"),
+        "-hls_segment_filename",
+        str(OUTPUT_DIR / "segment_%08d.ts"),
         str(OUTPUT_DIR / "stream.m3u8"),
     ]
 
 
-def publisher_loop() -> None:
+def publish_loop() -> None:
     VIDEO_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     while True:
         try:
             entries = load_playlist()
-            check_compatible_media(entries)
-            command = ffmpeg_command(entries)
+            command = build_ffmpeg_command(entries)
 
             LOG.info(
-                "Tek FFmpeg süreci başlıyor; %s video playlist sırasıyla dönecek",
+                "Tek FFmpeg süreci başladı; %d video sırayla yayınlanacak",
                 len(entries),
             )
             result = subprocess.run(command, check=False)
 
-            LOG.error("FFmpeg durdu (%s); 5 saniye sonra yeniden başlatılıyor", result.returncode)
+            LOG.error(
+                "FFmpeg durdu (kod %s); 5 saniye sonra yeniden denenecek",
+                result.returncode,
+            )
             time.sleep(5)
 
         except Exception:
-            LOG.exception("Yayın başlatılamadı; 10 saniye sonra tekrar denenecek")
+            LOG.exception(
+                "Yayın başlatılamadı; 10 saniye sonra tekrar denenecek"
+            )
             time.sleep(10)
 
 
@@ -290,7 +284,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(
-        target=publisher_loop,
+        target=publish_loop,
         name="ffmpeg-publisher",
         daemon=True,
     ).start()
